@@ -7,8 +7,9 @@ let isPlaying = false;
 let volume = GetProfileSetting(306) / 10;
 let previousVolume = volume;
 
-for (let i = 0, length = GetNumResourceMetadata("radio", "supersede_radio"); i < length; i++) {
-    const radio = GetResourceMetadata("radio", "supersede_radio", i);
+// Read metadata from this resource so users can rename its folder without breaking station loading.
+for (let i = 0, length = GetNumResourceMetadata(resourceName, "supersede_radio"); i < length; i++) {
+    const radio = GetResourceMetadata(resourceName, "supersede_radio", i);
 
     if (!availableRadios.includes(radio)) {
         console.error(`${resourceName}: ${radio} is an invalid radio.`);
@@ -16,7 +17,7 @@ for (let i = 0, length = GetNumResourceMetadata("radio", "supersede_radio"); i <
     }
 
     try {
-        const data = JSON.parse(GetResourceMetadata("radio", "supersede_radio_extra", i));
+        const data = JSON.parse(GetResourceMetadata(resourceName, "supersede_radio_extra", i));
         if (data !== null) {
             customRadios.push({
                 "name": radio,
