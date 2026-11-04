@@ -22,6 +22,11 @@
             this.isInside = isInside;
             this.isLoud = isLoud;
             this.position = position;
+            this.retryDelay = 1000;
+            this.retryTimer = null;
+            this.stableTimer = null;
+            this.sourceToken = 0;
+            this.isStopped = false;
 
             this.panner = audioContext.createPanner();
             this.panner.panningModel = 'HRTF';
@@ -38,6 +43,14 @@
                 const self = this;
                 const station = stations[this.index];
 
+                if (!station || !station.data || !station.data.url) {
+                    console.error(`[FiveM Radio] Station ${this.index} has no playable URL.`);
+                    return;
+                }
+
+                self.isStopped = false;
+                const sourceToken = ++self.sourceToken;
+
                 // Setup a new audio element if needed.
                 if (!self.sound) {
                     self.sound = new Audio();
@@ -47,26 +60,71 @@
                     self.panner.connect(audioContext.destination);
                 }
 
+                // Streams can end or fail transiently; reconnect using the current source token only.
+                self.sound.onended = () => self.scheduleReconnect(sourceToken, 'stream ended');
+                self.sound.onerror = () => self.scheduleReconnect(sourceToken, 'media error');
+
                 // Set media source.
                 self.sound.src = station.data.url;
+                self.sound.load();
 
                 // Set inital position and volume.
                 self.setPosition(self.isInside, self.isLoud, self.position);
 
                 // Begin playing the sound.
-                try {
-                    self.sound.play().catch(() => {});
-                } catch (err) {
-                    console.error(err);
+                audioContext.resume().catch((err) => console.warn('[FiveM Radio] Audio context resume failed:', err));
+                self.sound.play().then(() => {
+                    if (sourceToken === self.sourceToken) {
+                        if (self.stableTimer) clearTimeout(self.stableTimer);
+                        self.stableTimer = setTimeout(() => {
+                            if (sourceToken === self.sourceToken) self.retryDelay = 1000;
+                            self.stableTimer = null;
+                        }, 60000);
+                    }
+                }).catch((err) => self.scheduleReconnect(sourceToken, err.message || 'playback failed'));
+            },
+
+            /** Retry a failed or ended stream with capped exponential backoff. */
+            scheduleReconnect: function (sourceToken, reason) {
+                if (this.isStopped || sourceToken !== this.sourceToken || this.retryTimer) {
+                    return;
                 }
+
+                if (this.stableTimer) {
+                    clearTimeout(this.stableTimer);
+                    this.stableTimer = null;
+                }
+
+                const delay = this.retryDelay;
+                this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+                console.warn(`[FiveM Radio] ${reason}; retrying in ${delay}ms.`);
+                this.retryTimer = setTimeout(() => {
+                    this.retryTimer = null;
+                    if (!this.isStopped && sourceToken === this.sourceToken) this.play();
+                }, delay);
             },
 
             /**
              * Stop a station's live stream.
              */
             stop: function () {
+                this.isStopped = true;
+                this.sourceToken++;
+                if (this.retryTimer) {
+                    clearTimeout(this.retryTimer);
+                    this.retryTimer = null;
+                }
+                if (this.stableTimer) {
+                    clearTimeout(this.stableTimer);
+                    this.stableTimer = null;
+                }
+
                 if (this.sound) {
-                    this.sound.src = '';
+                    this.sound.onended = null;
+                    this.sound.onerror = null;
+                    this.sound.pause();
+                    this.sound.removeAttribute('src');
+                    this.sound.load();
                 }
             },
 
@@ -75,7 +133,13 @@
              */
             setVolume: function() {
                 if (this.sound) {
-                    this.sound.volume  = ((stations[this.index].data.volume || 1.0) * volume) / (this.isInside || this.isLoud ? 1 : 2);
+                    const stationVolume = Number.isFinite(stations[this.index].data.volume)
+                        ? stations[this.index].data.volume
+                        : 1.0;
+                    const profileVolume = Number.isFinite(volume) ? volume : 1.0;
+                    this.sound.volume = Math.max(0, Math.min(1,
+                        (stationVolume * profileVolume) / (this.isInside || this.isLoud ? 1 : 2)
+                    ));
                 }
             },
 
@@ -86,6 +150,7 @@
             setIndex: function(index) {
                 this.stop();
                 this.index = index;
+                this.retryDelay = 1000;
                 this.play();
             },
 
@@ -111,11 +176,25 @@
             },
         };
 
-        fetch(`https://${GetParentResourceName()}/ready`, { "method": "POST", "body": "{}" }).then(res => res.json()).then((data) => {
-            stations = data.radios;
-            volume = data.volume;
+        const resourceName = GetParentResourceName();
 
-            window.addEventListener('message', (event) => {
+        // NUI may load before the client callback is ready, so retry initialization instead of staying silent.
+        async function initialize(retryCount = 0) {
+            try {
+                const response = await fetch(`https://${resourceName}/ready`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}'
+                });
+                if (!response.ok) throw new Error(`ready callback returned HTTP ${response.status}`);
+
+                const data = await response.json();
+                if (!Array.isArray(data.radios)) throw new Error('ready callback returned an invalid radio list');
+
+                stations = data.radios;
+                volume = Number.isFinite(data.volume) ? data.volume : 1.0;
+
+                window.addEventListener('message', (event) => {
                 let item = event.data;
 
                 switch (item.type) {
@@ -156,8 +235,16 @@
 
                         break;
                 }
-            });
-        });
+                });
+            } catch (error) {
+                const delay = Math.min(1000 * (2 ** retryCount), 15000);
+                console.error(`[FiveM Radio] NUI initialization failed: ${error.message}`);
+                console.warn(`[FiveM Radio] Retrying NUI initialization in ${delay}ms.`);
+                setTimeout(() => initialize(retryCount + 1), delay);
+            }
+        }
+
+        initialize();
     </script>
 </head>
 <body>
